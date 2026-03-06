@@ -33,7 +33,6 @@
 - HTML5 + CSS3
 - Vue 3 + Vite
 - 响应式设计（移动优先）
-- 微信 JSSDK（支持微信支付、分享）
 - **部署：Cloudflare Pages**
 
 **后端：**
@@ -97,10 +96,11 @@
 └─────────────────────────────────────────┘
             ↓
 ┌─────────────────────────────────────────┐
-│  第三方服务                              │
+│  后续扩展（可选）                        │
 ├─────────────────────────────────────────┤
-│  - 微信支付                              │
-│  - 微信登录                              │
+│  - 短信验证码服务                         │
+│  - 微信登录（需要企业认证）               │
+│  - 微信支付                               │
 └─────────────────────────────────────────┘
 ```
 
@@ -112,17 +112,21 @@
 
 #### 1.1 用户注册/登录
 
-**需求：**
-- 支持手机号注册
-- 支持微信授权登录
+**需求（MVP - 极简版）：**
+- 支持手机号注册（无验证码）
+- 支持手机号登录
 - 支持家长和孩子双角色
 - 支持绑定家庭关系
+
+**说明：**
+- MVP 版本不实现验证码验证，仅做基础校验
+- 后续可以升级为短信验证码或微信登录
+- 简化流程，快速上线测试
 
 **接口：**
 ```
 POST /api/auth/register
 POST /api/auth/login
-POST /api/auth/wechat-login
 GET  /api/auth/me
 ```
 
@@ -780,14 +784,12 @@ CREATE TABLE users (
   avatar TEXT,
   role TEXT NOT NULL CHECK (role IN ('parent', 'child')),
   family_id INTEGER,
-  wechat_openid TEXT UNIQUE,
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY (family_id) REFERENCES families(id)
 );
 
 CREATE INDEX idx_users_phone ON users(phone);
-CREATE INDEX idx_users_wechat_openid ON users(wechat_openid);
 CREATE INDEX idx_users_family_id ON users(family_id);
 ```
 
@@ -1061,20 +1063,31 @@ export const authRoutes = new Hono<{ Bindings: Env }>()
 authRoutes.post('/register', async (c) => {
   const { phone, nickname, role } = await c.req.json()
 
+  // 基础校验
+  if (!phone || !role) {
+    return c.json({ error: '手机号和角色不能为空' }, 400)
+  }
+
+  // 手机号格式校验
+  const phoneRegex = /^1[3-9]\d{9}$/
+  if (!phoneRegex.test(phone)) {
+    return c.json({ error: '手机号格式不正确' }, 400)
+  }
+
   // 检查用户是否已存在
   const existing = await c.env.DB.prepare(
     'SELECT id FROM users WHERE phone = ?'
   ).bind(phone).first()
 
   if (existing) {
-    return c.json({ error: '用户已存在' }, 400)
+    return c.json({ error: '该手机号已注册' }, 400)
   }
 
   // 创建用户
   const result = await c.env.DB.prepare(`
     INSERT INTO users (phone, nickname, role)
     VALUES (?, ?, ?)
-  `).bind(phone, nickname, role).run()
+  `).bind(phone, nickname || phone.slice(-4), role).run()
 
   const userId = result.meta.last_row_id
 
@@ -1087,7 +1100,7 @@ authRoutes.post('/register', async (c) => {
   return c.json({
     success: true,
     token,
-    user: { id: userId, phone, nickname, role }
+    user: { id: userId, phone, nickname: nickname || phone.slice(-4), role }
   })
 })
 
@@ -1095,12 +1108,17 @@ authRoutes.post('/register', async (c) => {
 authRoutes.post('/login', async (c) => {
   const { phone } = await c.req.json()
 
+  if (!phone) {
+    return c.json({ error: '手机号不能为空' }, 400)
+  }
+
+  // 查找用户
   const user = await c.env.DB.prepare(
     'SELECT * FROM users WHERE phone = ?'
   ).bind(phone).first()
 
   if (!user) {
-    return c.json({ error: '用户不存在' }, 404)
+    return c.json({ error: '该手机号未注册' }, 404)
   }
 
   const token = await sign(
@@ -1115,50 +1133,8 @@ authRoutes.post('/login', async (c) => {
   })
 })
 
-// 微信登录
-authRoutes.post('/wechat-login', async (c) => {
-  const { code } = await c.req.json()
-
-  // 调用微信 API 获取 openid
-  const wechatResponse = await fetch(
-    `https://api.weixin.qq.com/sns/jscode2session?appid=${process.env.WECHAT_APPID}&secret=${process.env.WECHAT_SECRET}&js_code=${code}&grant_type=authorization_code`
-  )
-  const wechatData = await wechatResponse.json()
-
-  if (!wechatData.openid) {
-    return c.json({ error: '微信授权失败' }, 400)
-  }
-
-  // 查找或创建用户
-  let user = await c.env.DB.prepare(
-    'SELECT * FROM users WHERE wechat_openid = ?'
-  ).bind(wechatData.openid).first()
-
-  if (!user) {
-    const result = await c.env.DB.prepare(`
-      INSERT INTO users (wechat_openid, nickname, role)
-      VALUES (?, ?, ?)
-    `).bind(wechatData.openid, '微信用户', 'child').run()
-
-    user = {
-      id: result.meta.last_row_id,
-      wechat_openid: wechatData.openid,
-      nickname: '微信用户',
-      role: 'child'
-    }
-  }
-
-  const token = await sign(
-    { userId: user.id, role: user.role },
-    c.env.JWT_SECRET
-  )
-
-  return c.json({
-    success: true,
-    token,
-    user
-  })
-})
+// 注：微信登录需要企业认证，MVP 版本暂不实现
+// 微信登录接口将在后续版本中添加
 
 // 认证中间件
 export const authMiddleware = async (c: any, next: any) => {
@@ -1522,3 +1498,27 @@ npx wrangler pages deploy dist
 - 先跑通核心流程
 - 再优化细节体验
 - 最后扩展新功能
+
+---
+
+## MVP 版本说明
+
+**v1.0 MVP（当前版本）：**
+- ✅ 手机号注册/登录（无验证码）
+- ✅ 家长和孩子双角色
+- ✅ 项目系统完整流程
+- ✅ 价值收入和账户管理
+- ❌ 短信验证码（待后续版本）
+- ❌ 微信登录（需要企业认证，收费）
+- ❌ 微信支付（待后续版本）
+
+**简化原因：**
+1. 快速上线测试核心功能
+2. 避免第三方服务费用
+3. 降低开发复杂度
+4. 专注教育理念验证
+
+**后续升级路径：**
+- v1.1：添加短信验证码（阿里云/腾讯云）
+- v1.2：添加微信登录（企业认证后）
+- v1.3：添加微信支付（企业认证后）
