@@ -31,24 +31,27 @@
 
 **前端：**
 - HTML5 + CSS3
-- Vue 3 + Vite（或原生 JS）
+- Vue 3 + Vite
 - 响应式设计（移动优先）
 - 微信 JSSDK（支持微信支付、分享）
+- **部署：Cloudflare Pages**
 
 **后端：**
-- Node.js + Express / Koa
-- RESTful API
-- JWT 认证
-- WebSocket（实时推送）
+- **Cloudflare Workers**（边缘运行时）
+- Hono / Itty-Router（轻量级路由）
+- D1 Database（边缘数据库）
+- KV（缓存和会话管理）
+- R2（文件存储，可选）
 
 **数据库：**
-- PostgreSQL（主数据库）
-- Redis（缓存）
+- **Cloudflare D1**（基于 SQLite 的边缘数据库）
+- **Cloudflare KV**（缓存和会话）
 
 **部署：**
-- 云服务器（阿里云 / 腾讯云）
-- Nginx 反向代理
-- HTTPS
+- **Cloudflare Pages**（前端）
+- **Cloudflare Workers**（后端 API）
+- **Cloudflare D1**（数据库）
+- 全自动 CI/CD
 
 ---
 
@@ -66,25 +69,38 @@
 └─────────────────────────────────────────┘
             ↓ HTTPS
 ┌─────────────────────────────────────────┐
-│  后端服务（Node.js）                     │
+│  Cloudflare Pages（前端）               │
 ├─────────────────────────────────────────┤
-│  API 网关                                 │
+│  - Vue 3 SPA                            │
+│  - 全局 CDN 分发                        │
+│  - 自动 HTTPS                           │
+└─────────────────────────────────────────┘
+            ↓
+┌─────────────────────────────────────────┐
+│  Cloudflare Workers（后端 API）          │
+├─────────────────────────────────────────┤
+│  - 边缘运行时（全球节点）                │
+│  - Hono / Itty-Router                   │
 │  - 认证中间件                            │
 │  - 权限控制                              │
 └─────────────────────────────────────────┘
             ↓
 ┌─────────────────────────────────────────┐
-│  业务服务层                              │
+│  Cloudflare Data Layer                  │
 ├─────────────────────────────────────────┤
-│  - 用户服务              - 项目服务      │
-│  - 账户服务              - 价值服务      │
-│  - 成就服务              - 通知服务      │
+│  D1 Database            KV Cache         │
+│  - 用户数据             - 会话缓存        │
+│  - 项目数据             - 热点数据        │
+│  - 账户数据             - 限流计数        │
+│  R2 Storage（可选）                     │
+│  - 文件上传                               │
 └─────────────────────────────────────────┘
             ↓
 ┌─────────────────────────────────────────┐
-│  数据层                                  │
+│  第三方服务                              │
 ├─────────────────────────────────────────┤
-│  PostgreSQL              Redis           │
+│  - 微信支付                              │
+│  - 微信登录                              │
 └─────────────────────────────────────────┘
 ```
 
@@ -751,101 +767,664 @@ POST /api/notifications/read-all
 
 ## 数据模型
 
-### 数据库表设计
+### D1 数据库表设计
+
+> Cloudflare D1 基于 SQLite，使用标准 SQL 语法。
 
 #### users 表
 ```sql
 CREATE TABLE users (
-  id SERIAL PRIMARY KEY,
-  phone VARCHAR(20) UNIQUE NOT NULL,
-  nickname VARCHAR(50),
-  avatar VARCHAR(255),
-  role VARCHAR(10) NOT NULL CHECK (role IN ('parent', 'child')),
-  family_id INTEGER REFERENCES families(id),
-  wechat_openid VARCHAR(100),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  phone TEXT UNIQUE NOT NULL,
+  nickname TEXT,
+  avatar TEXT,
+  role TEXT NOT NULL CHECK (role IN ('parent', 'child')),
+  family_id INTEGER,
+  wechat_openid TEXT UNIQUE,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (family_id) REFERENCES families(id)
 );
+
+CREATE INDEX idx_users_phone ON users(phone);
+CREATE INDEX idx_users_wechat_openid ON users(wechat_openid);
+CREATE INDEX idx_users_family_id ON users(family_id);
 ```
 
 #### families 表
 ```sql
 CREATE TABLE families (
-  id SERIAL PRIMARY KEY,
-  parent_id INTEGER REFERENCES users(id),
-  child_id INTEGER REFERENCES users(id),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER NOT NULL,
+  child_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (parent_id) REFERENCES users(id),
+  FOREIGN KEY (child_id) REFERENCES users(id)
 );
+
+CREATE INDEX idx_families_parent ON families(parent_id);
+CREATE INDEX idx_families_child ON families(child_id);
 ```
 
 #### projects 表
 ```sql
 CREATE TABLE projects (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(100) NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
   description TEXT,
-  type VARCHAR(20) NOT NULL CHECK (type IN ('learning', 'innovation', 'service', 'investment')),
+  type TEXT NOT NULL CHECK (type IN ('learning', 'innovation', 'service', 'investment')),
   goal TEXT,
-  budget DECIMAL(10,2) NOT NULL,
-  spent DECIMAL(10,2) DEFAULT 0,
-  value DECIMAL(10,2) DEFAULT 0,
-  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'in_progress', 'completed', 'rejected')),
-  deadline DATE,
-  applicant_id INTEGER REFERENCES users(id),
-  approver_id INTEGER REFERENCES users(id),
-  extra_value DECIMAL(10,2) DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  budget REAL NOT NULL,
+  spent REAL DEFAULT 0,
+  value REAL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'in_progress', 'completed', 'rejected')),
+  deadline TEXT,
+  applicant_id INTEGER NOT NULL,
+  approver_id INTEGER,
+  extra_value REAL DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (applicant_id) REFERENCES users(id),
+  FOREIGN KEY (approver_id) REFERENCES users(id)
 );
+
+CREATE INDEX idx_projects_applicant ON projects(applicant_id);
+CREATE INDEX idx_projects_status ON projects(status);
+CREATE INDEX idx_projects_type ON projects(type);
 ```
 
 #### value_records 表
 ```sql
 CREATE TABLE value_records (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  type VARCHAR(20) NOT NULL CHECK (type IN ('learning', 'innovation', 'service', 'investment')),
-  amount DECIMAL(10,2) NOT NULL,
-  project_id INTEGER REFERENCES projects(id),
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('learning', 'innovation', 'service', 'investment')),
+  amount REAL NOT NULL,
+  project_id INTEGER,
   description TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (project_id) REFERENCES projects(id)
 );
+
+CREATE INDEX idx_value_records_user ON value_records(user_id);
+CREATE INDEX idx_value_records_created ON value_records(created_at);
 ```
 
 #### accounts 表
 ```sql
 CREATE TABLE accounts (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  type VARCHAR(20) NOT NULL CHECK (type IN ('spending', 'savings', 'investment')),
-  balance DECIMAL(10,2) DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('spending', 'savings', 'investment')),
+  balance REAL DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+CREATE INDEX idx_accounts_user ON accounts(user_id);
+CREATE INDEX idx_accounts_type ON accounts(type);
 ```
 
 #### transactions 表
 ```sql
 CREATE TABLE transactions (
-  id SERIAL PRIMARY KEY,
-  user_id INTEGER REFERENCES users(id),
-  account_type VARCHAR(20) NOT NULL CHECK (account_type IN ('spending', 'savings', 'investment')),
-  type VARCHAR(10) NOT NULL CHECK (type IN ('in', 'out')),
-  amount DECIMAL(10,2) NOT NULL,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  account_type TEXT NOT NULL CHECK (account_type IN ('spending', 'savings', 'investment')),
+  type TEXT NOT NULL CHECK (type IN ('in', 'out')),
+  amount REAL NOT NULL,
   description TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+CREATE INDEX idx_transactions_user ON transactions(user_id);
+CREATE INDEX idx_transactions_created ON transactions(created_at);
+```
+
+#### achievements 表
+```sql
+CREATE TABLE achievements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  icon TEXT,
+  progress INTEGER DEFAULT 0,
+  target INTEGER NOT NULL,
+  unlocked INTEGER DEFAULT 0,
+  unlocked_at TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX idx_achievements_user ON achievements(user_id);
+```
+
+#### notifications 表
+```sql
+CREATE TABLE notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  type TEXT NOT NULL CHECK (type IN ('project_approved', 'project_completed', 'value_received')),
+  title TEXT NOT NULL,
+  content TEXT,
+  read INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE INDEX idx_notifications_user ON notifications(user_id);
+CREATE INDEX idx_notifications_read ON notifications(read);
+CREATE INDEX idx_notifications_created ON notifications(created_at);
+```
+
+### D1 数据库操作
+
+```typescript
+// Cloudflare Workers 中使用 D1
+export interface Env {
+  DB: D1Database;
+  KV: KVNamespace;
+}
+
+// 查询示例
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // 创建用户
+    await env.DB.prepare(`
+      INSERT INTO users (phone, nickname, role)
+      VALUES (?, ?, ?)
+    `).bind('13800138000', '测试用户', 'parent').run();
+
+    // 查询用户
+    const user = await env.DB.prepare(`
+      SELECT * FROM users WHERE phone = ?
+    `).bind('13800138000').first();
+
+    // 更新用户
+    await env.DB.prepare(`
+      UPDATE users SET nickname = ? WHERE id = ?
+    `).bind('新昵称', 1).run();
+
+    return Response.json(user);
+  }
+};
 ```
 
 ---
+
+## Cloudflare Workers 实现
+
+### 项目结构
+
+```
+growth-capital/
+├── workers/                 # Cloudflare Workers API
+│   ├── src/
+│   │   ├── index.ts        # 入口文件
+│   │   ├── routes/         # 路由定义
+│   │   ├── middleware/     # 中间件
+│   │   ├── controllers/    # 控制器
+│   │   └── utils/          # 工具函数
+│   ├── schema.sql          # D1 数据库表结构
+│   └── wrangler.toml       # Workers 配置
+├── frontend/               # Vue 3 前端
+│   ├── src/
+│   ├── public/
+│   └── package.json
+└── README.md
+```
+
+### Workers 配置（wrangler.toml）
+
+```toml
+name = "growth-capital-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "growth-capital-db"
+database_id = "your-database-id"
+
+# KV 缓存绑定
+[[kv_namespaces]]
+binding = "KV"
+id = "your-kv-namespace-id"
+
+# 环境变量
+[vars]
+ENVIRONMENT = "production"
+JWT_SECRET = "your-jwt-secret"
+
+# 开发环境配置
+[env.development]
+vars = { ENVIRONMENT = "development" }
+
+[[env.development.d1_databases]]
+binding = "DB"
+database_name = "growth-capital-db-dev"
+database_id = "your-dev-database-id"
+```
+
+### Workers API 实现（使用 Hono）
+
+```typescript
+// src/index.ts
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+import { logger } from 'hono/logger'
+import { authRoutes } from './routes/auth'
+import { projectRoutes } from './routes/projects'
+import { accountRoutes } from './routes/accounts'
+
+export interface Env {
+  DB: D1Database;
+  KV: KVNamespace;
+  JWT_SECRET: string;
+}
+
+const app = new Hono<{ Bindings: Env }>()
+
+// 中间件
+app.use('*', cors())
+app.use('*', logger())
+
+// 路由
+app.route('/api/auth', authRoutes)
+app.route('/api/projects', projectRoutes)
+app.route('/api/accounts', accountRoutes)
+
+// 健康检查
+app.get('/health', (c) => {
+  return c.json({ status: 'ok', timestamp: Date.now() })
+})
+
+export default app
+```
+
+### 用户认证路由
+
+```typescript
+// src/routes/auth.ts
+import { Hono } from 'hono'
+import { sign, verify } from 'hono/jwt'
+
+export const authRoutes = new Hono<{ Bindings: Env }>()
+
+// 注册
+authRoutes.post('/register', async (c) => {
+  const { phone, nickname, role } = await c.req.json()
+
+  // 检查用户是否已存在
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM users WHERE phone = ?'
+  ).bind(phone).first()
+
+  if (existing) {
+    return c.json({ error: '用户已存在' }, 400)
+  }
+
+  // 创建用户
+  const result = await c.env.DB.prepare(`
+    INSERT INTO users (phone, nickname, role)
+    VALUES (?, ?, ?)
+  `).bind(phone, nickname, role).run()
+
+  const userId = result.meta.last_row_id
+
+  // 生成 JWT
+  const token = await sign(
+    { userId, phone, role },
+    c.env.JWT_SECRET
+  )
+
+  return c.json({
+    success: true,
+    token,
+    user: { id: userId, phone, nickname, role }
+  })
+})
+
+// 登录
+authRoutes.post('/login', async (c) => {
+  const { phone } = await c.req.json()
+
+  const user = await c.env.DB.prepare(
+    'SELECT * FROM users WHERE phone = ?'
+  ).bind(phone).first()
+
+  if (!user) {
+    return c.json({ error: '用户不存在' }, 404)
+  }
+
+  const token = await sign(
+    { userId: user.id, phone: user.phone, role: user.role },
+    c.env.JWT_SECRET
+  )
+
+  return c.json({
+    success: true,
+    token,
+    user
+  })
+})
+
+// 微信登录
+authRoutes.post('/wechat-login', async (c) => {
+  const { code } = await c.req.json()
+
+  // 调用微信 API 获取 openid
+  const wechatResponse = await fetch(
+    `https://api.weixin.qq.com/sns/jscode2session?appid=${process.env.WECHAT_APPID}&secret=${process.env.WECHAT_SECRET}&js_code=${code}&grant_type=authorization_code`
+  )
+  const wechatData = await wechatResponse.json()
+
+  if (!wechatData.openid) {
+    return c.json({ error: '微信授权失败' }, 400)
+  }
+
+  // 查找或创建用户
+  let user = await c.env.DB.prepare(
+    'SELECT * FROM users WHERE wechat_openid = ?'
+  ).bind(wechatData.openid).first()
+
+  if (!user) {
+    const result = await c.env.DB.prepare(`
+      INSERT INTO users (wechat_openid, nickname, role)
+      VALUES (?, ?, ?)
+    `).bind(wechatData.openid, '微信用户', 'child').run()
+
+    user = {
+      id: result.meta.last_row_id,
+      wechat_openid: wechatData.openid,
+      nickname: '微信用户',
+      role: 'child'
+    }
+  }
+
+  const token = await sign(
+    { userId: user.id, role: user.role },
+    c.env.JWT_SECRET
+  )
+
+  return c.json({
+    success: true,
+    token,
+    user
+  })
+})
+
+// 认证中间件
+export const authMiddleware = async (c: any, next: any) => {
+  const authHeader = c.req.header('Authorization')
+
+  if (!authHeader) {
+    return c.json({ error: '未授权' }, 401)
+  }
+
+  const token = authHeader.replace('Bearer ', '')
+
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET)
+    c.set('user', payload)
+    await next()
+  } catch (error) {
+    return c.json({ error: '无效的 token' }, 401)
+  }
+}
+```
+
+### 项目管理路由
+
+```typescript
+// src/routes/projects.ts
+import { Hono } from 'hono'
+import { authMiddleware } from '../routes/auth'
+
+export const projectRoutes = new Hono<{ Bindings: Env }>()
+
+// 所有路由需要认证
+projectRoutes.use('*', authMiddleware)
+
+// 获取项目列表
+projectRoutes.get('/', async (c) => {
+  const user = c.get('user')
+  const { type, status } = c.req.query()
+
+  let query = 'SELECT * FROM projects WHERE applicant_id = ?'
+  const params = [user.userId]
+
+  if (type) {
+    query += ' AND type = ?'
+    params.push(type)
+  }
+
+  if (status) {
+    query += ' AND status = ?'
+    params.push(status)
+  }
+
+  query += ' ORDER BY created_at DESC'
+
+  const projects = await c.env.DB.prepare(query)
+    .bind(...params)
+    .all()
+
+  return c.json({ success: true, projects: projects.results })
+})
+
+// 创建项目
+projectRoutes.post('/', async (c) => {
+  const user = c.get('user')
+  const { name, description, type, goal, budget, deadline, extraValue } = await c.req.json()
+
+  const result = await c.env.DB.prepare(`
+    INSERT INTO projects (name, description, type, goal, budget, deadline, applicant_id, extra_value)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(name, description, type, goal, budget, deadline, user.userId, extraValue || 0).run()
+
+  const projectId = result.meta.last_row_id
+
+  return c.json({
+    success: true,
+    project: { id: projectId, name, status: 'pending' }
+  })
+})
+
+// 审核项目
+projectRoutes.post('/:id/approve', async (c) => {
+  const user = c.get('user')
+  const projectId = c.req.param('id')
+  const { approved, reason } = await c.req.json()
+
+  if (user.role !== 'parent') {
+    return c.json({ error: '只有家长可以审核项目' }, 403)
+  }
+
+  if (approved) {
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET status = 'approved', approver_id = ?, updated_at = datetime('now')
+      WHERE id = ?
+    `).bind(user.userId, projectId).run()
+  } else {
+    await c.env.DB.prepare(`
+      UPDATE projects
+      SET status = 'rejected', updated_at = datetime('now')
+      WHERE id = ?
+    `).bind(projectId).run()
+
+    // 记录拒绝原因
+    await c.env.DB.prepare(`
+      INSERT INTO project_rejections (project_id, reason)
+      VALUES (?, ?)
+    `).bind(projectId, reason).run()
+  }
+
+  return c.json({ success: true })
+})
+
+// 完成项目
+projectRoutes.post('/:id/complete', async (c) => {
+  const user = c.get('user')
+  const projectId = c.req.param('id')
+  const { attachments, note } = await c.req.json()
+
+  // 更新项目状态
+  await c.env.DB.prepare(`
+    UPDATE projects
+    SET status = 'completed', updated_at = datetime('now')
+    WHERE id = ? AND applicant_id = ?
+  `).bind(projectId, user.userId).run()
+
+  return c.json({ success: true })
+})
+
+// 获取项目详情
+projectRoutes.get('/:id', async (c) => {
+  const projectId = c.req.param('id')
+
+  const project = await c.env.DB.prepare(`
+    SELECT * FROM projects WHERE id = ?
+  `).bind(projectId).first()
+
+  if (!project) {
+    return c.json({ error: '项目不存在' }, 404)
+  }
+
+  return c.json({ success: true, project })
+})
+```
+
+### 账户管理路由
+
+```typescript
+// src/routes/accounts.ts
+import { Hono } from 'hono'
+import { authMiddleware } from '../routes/auth'
+
+export const accountRoutes = new Hono<{ Bindings: Env }>()
+
+accountRoutes.use('*', authMiddleware)
+
+// 获取账户余额
+accountRoutes.get('/', async (c) => {
+  const user = c.get('user')
+
+  const accounts = await c.env.DB.prepare(`
+    SELECT * FROM accounts WHERE user_id = ?
+  `).bind(user.userId).all()
+
+  return c.json({ success: true, accounts: accounts.results })
+})
+
+// 价值入账分配
+accountRoutes.post('/distribute', async (c) => {
+  const user = c.get('user')
+  const { amount, distribution } = await c.req.json()
+
+  // 更新消费账户
+  await c.env.DB.prepare(`
+    UPDATE accounts
+    SET balance = balance + ?, updated_at = datetime('now')
+    WHERE user_id = ? AND type = 'spending'
+  `).bind(distribution.spending, user.userId).run()
+
+  // 更新储蓄账户
+  await c.env.DB.prepare(`
+    UPDATE accounts
+    SET balance = balance + ?, updated_at = datetime('now')
+    WHERE user_id = ? AND type = 'savings'
+  `).bind(distribution.savings, user.userId).run()
+
+  // 更新投资账户
+  await c.env.DB.prepare(`
+    UPDATE accounts
+    SET balance = balance + ?, updated_at = datetime('now')
+    WHERE user_id = ? AND type = 'investment'
+  `).bind(distribution.investment, user.userId).run()
+
+  return c.json({ success: true })
+})
+
+// 消费
+accountRoutes.post('/spending/withdraw', async (c) => {
+  const user = c.get('user')
+  const { amount, description } = await c.req.json()
+
+  // 检查余额
+  const account = await c.env.DB.prepare(`
+    SELECT balance FROM accounts WHERE user_id = ? AND type = 'spending'
+  `).bind(user.userId).first()
+
+  if (!account || account.balance < amount) {
+    return c.json({ error: '余额不足' }, 400)
+  }
+
+  // 扣除余额
+  await c.env.DB.prepare(`
+    UPDATE accounts
+    SET balance = balance - ?, updated_at = datetime('now')
+    WHERE user_id = ? AND type = 'spending'
+  `).bind(amount, user.userId).run()
+
+  // 记录交易
+  await c.env.DB.prepare(`
+    INSERT INTO transactions (user_id, account_type, type, amount, description)
+    VALUES (?, 'spending', 'out', ?, ?)
+  `).bind(user.userId, amount, description).run()
+
+  return c.json({ success: true })
+})
+```
+
+### D1 数据库初始化
+
+```bash
+# 创建 D1 数据库
+npx wrangler d1 create growth-capital-db
+
+# 初始化表结构
+npx wrangler d1 execute growth-capital-db --local --file=./workers/schema.sql
+
+# 本地开发
+npx wrangler dev
+
+# 部署
+npx wrangler deploy
+```
+
+### Cloudflare Pages 部署配置
+
+```toml
+# frontend/wrangler.toml
+name = "growth-capital-frontend"
+compatibility_date = "2024-01-01"
+
+[vars]
+API_URL = "https://growth-capital-api.workers.dev"
+```
+
+```bash
+# 部署前端到 Cloudflare Pages
+cd frontend
+npm run build
+npx wrangler pages deploy dist
+```
 
 ## 开发计划
 
 ### Phase 1：MVP 开发（2周）
 
 **Week 1：**
-- [x] 项目初始化
-- [x] 数据库设计
+- [x] Cloudflare Workers 项目初始化
+- [x] D1 数据库设计和初始化
 - [ ] 用户系统（注册/登录）
 - [ ] 家庭关系绑定
 
@@ -873,18 +1452,24 @@ CREATE TABLE transactions (
 ### Phase 3：测试上线（1周）
 
 **Week 5：**
-- [ ] 内部测试
-- [ ] Bug 修复
-- [ ] 部署上线
-
----
+- [ ] 本地测试（wrangler dev）
+- [ ] Cloudflare 预览环境测试
+- [ ] 正式部署
+- [ ] 监控和日志
 
 ## 技术要求
 
 ### 性能要求
-- 首屏加载 < 2s
-- 接口响应 < 500ms
-- 支持 1000 并发
+- 首屏加载 < 2s（Cloudflare CDN）
+- API 响应 < 500ms（边缘计算）
+- 支持全球访问（300+ 节点）
+- D1 查询 < 100ms
+
+### 免费额度
+- Workers: 100,000 请求/天
+- Pages: 500 构建次数/月
+- D1: 5GB 存储 / 2500 万次读取/月
+- KV: 100,000 次读取/天
 
 ### 兼容性要求
 - iOS 13+
@@ -893,12 +1478,11 @@ CREATE TABLE transactions (
 - Safari / Chrome
 
 ### 安全要求
-- HTTPS 加密
+- HTTPS（自动）
 - JWT 认证
-- SQL 注入防护
-- XSS 防护
-
----
+- CORS 配置
+- 输入验证
+- SQL 注入防护（D1 参数化查询）
 
 ## 成功指标
 
@@ -917,11 +1501,17 @@ CREATE TABLE transactions (
 - 孩子主动发现机会
 - 可能真正创业
 
----
-
 ## 备注
 
 **核心原则：做少，但做到极致。**
+
+**Cloudflare 优势：**
+- 全球 CDN，极致性能
+- 边缘计算，低延迟
+- 免费额度充足
+- 自动 HTTPS
+- 零运维成本
+- 无限扩展能力
 
 **技术优先级：**
 - 用户体验 > 功能完整性
